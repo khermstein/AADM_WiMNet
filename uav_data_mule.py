@@ -12,6 +12,12 @@ from typing import List, TextIO
 from struct import unpack
 from argparse import ArgumentParser
 
+import scipy.optimize as opt
+import matplotlib.pyplot as plt
+from pykml import parser
+from matplotlib import path
+from itertools import groupby, combinations
+
 from aerpawlib.runner import StateMachine
 from aerpawlib.aerpaw import AERPAW_Platform
 from aerpawlib.vehicle import Vehicle, Drone
@@ -38,6 +44,7 @@ class DataMule(StateMachine):
     update_bs_id =""
     nextWaypointIndex = 0
     lastWaypointIndex = 0  
+    nextBS = []
     waitTime = 0
     uav_altitude = 25
     angles = []
@@ -48,6 +55,13 @@ class DataMule(StateMachine):
     max_speed = 10 #mps
     target_speed = 10
     
+    lat_eNBs = [35.7275, 35.728056, 35.725, 35.733056]
+    lon_eNBs = [-78.695833, -78.700833, -78.691667, -78.698333]
+    alt_eNBs = [10, 10, 10, 10] # altitudes for eNodeBs
+    r_eNBs = [0.0006, 0.0006, 0.0008, 0.0035] #Radius for eNobeB neighborhoods
+    dummy_waypoint_lon = -78.6943
+    dummy_waypoint_lat = 35.7249
+
     _next_sample: float = 0
     _sampling_delay: float
     _cur_line: int
@@ -180,20 +194,184 @@ class DataMule(StateMachine):
         
     def extractWaypointsFromPlanFile(self, plan_file):
         return extract_waypoints(plan_file)
+    
+    def inpolygon(self, xq, yq, xv, yv):
+        shape = xq.shape
+        #xq = xq.reshape(-1)
+        #yq = yq.reshape(-1)
+        xv = xv.reshape(-1)
+        yv = yv.reshape(-1)
+        q = [(xq[i], yq[i]) for i in range(xq.shape[0])]
+        p = path.Path([(xv[i], yv[i]) for i in range(xv.shape[0])])
+        return p.contains_points(q).reshape(shape)
+    
+    def sampleNeighborhood(self, lat_center, lon_center, radius_deg, N, geofence_lat, geofence_lon):
+        radius_m = radius_deg * 111320
+        latSamples = np.zeros((N,1))
+        lonSamples = np.copy(latSamples)
+
+        #Look at 100 evenly spaced points on neighborhood edge
+        thetas=np.linspace(0,2*np.pi, 100)
+        delta_lat = (radius_m / 6371000) * (180/np.pi) * np.cos(thetas)
+        delta_lon = (radius_m / 6371000) * (180/np.pi) * np.sin(thetas)
+        tmp_lat = np.array(lat_center+delta_lat)
+        tmp_lon = np.array(lon_center+delta_lon)
+        
+        valid_idcs = self.inpolygon(tmp_lon, tmp_lat, geofence_lon, geofence_lat)
+        x = [1 if valid else 0 for valid in valid_idcs]
+        # print([k for k,g in groupby(x)])
+        # print([list(g) for k,g in groupby(x)])
+        max_group = 0
+        max_idx = 0
+        curr_idx = 0
+        for k,g in groupby(x):
+            length = len(list(g))
+            if k == 1:
+                if length > max_group:
+                    max_group = length
+                    max_idx = curr_idx
+            curr_idx += length
+        
+        thetas = np.linspace(thetas[max_idx], thetas[max_idx + max_group -1], N)
+        delta_lat = (radius_m / 6371000) * (180/np.pi) * np.cos(thetas)
+        delta_lon = (radius_m / 6371000) * (180/np.pi) * np.sin(thetas)
+        latSamples = lat_center+delta_lat
+        lonSamples = lon_center+delta_lon
+        return lonSamples, latSamples
+    
+    def haversine(self, lat1, lon1, lat2, lon2):
+        return 2 * 6371000 * np.arcsin(np.sqrt(np.sin(np.deg2rad(lat2 - lat1) / 2)**2 + np.cos(np.deg2rad(lat1)) * np.cos(np.deg2rad(lat2)) * np.sin(np.deg2rad(lon2 - lon1) / 2)**2))
+
+    def readGeofence(self, filepath):
+        with open(filepath, 'r', encoding="utf-8") as f:
+            root = parser.parse(f).getroot()
+        coords = root.Document.Placemark.Polygon.outerBoundaryIs.LinearRing.coordinates
+        lonlatel = coords.text.strip().split(' ')
+        #print(lonlatel)
+        geofence_lon = []
+        geofence_lat = []
+        for xyz in lonlatel:
+            lon, lat, _ = xyz.split(',')
+            geofence_lon.append(float(lon))
+            geofence_lat.append(float(lat))
+        geofence_lon  = np.reshape(np.array(geofence_lon), (-1,1))
+        geofence_lat  = np.reshape(np.array(geofence_lat), (-1,1))
+        return geofence_lon, geofence_lat
 
     def compute_initial_waypoints(self):       
         # Write your code here
+        N = 10
+        total_nodes = N*len(self.lat_eNBs) + 1
+        all_lons = np.zeros((len(self.lat_eNBs), N))
+        all_lats = np.zeros((len(self.lat_eNBs), N))
+        lz_lon = -78.6962747
+        lz_lat = 35.7274823
+        geofence_lon, geofence_lat = self.readGeofence('./AERPAW_UAV_Geofence_Phase_1.kml')
 
+        for i in range(len(self.lat_eNBs)):
+            lonSamples, latSamples = self.sampleNeighborhood(self.lat_eNBs[i], self.lon_eNBs[i], self.r_eNBs[i], N, geofence_lat, geofence_lon)
+            plt.scatter(lonSamples,latSamples, marker='x')
+            all_lons[i,:] = lonSamples
+            all_lats[i,:] = latSamples
+        all_lons = np.reshape(all_lons, (1,-1))
+        all_lats = np.reshape(all_lats, (1,-1))
+        all_lats = np.insert(all_lats, 0, lz_lat)
+        all_lons = np.insert(all_lons, 0, lz_lon)
+
+        idxs  = list(combinations(np.arange(0,total_nodes), 2))
+
+        self.N1_idcs = np.arange(start=1, stop = 1+N)
+        self.N2_idcs = self.N1_idcs + N
+        self.N3_idcs = self.N2_idcs + N
+        self.N4_idcs = self.N3_idcs + N
+
+        #Remove edges within a neighborhood
+        remove_idcs = []
+        for i in range(len(idxs)):
+            if np.any(self.N1_idcs == idxs[i][0]) and np.any(self.N1_idcs == idxs[i][1]):
+                remove_idcs.append(i)
+            elif np.any(self.N2_idcs == idxs[i][0]) and np.any(self.N2_idcs == idxs[i][1]):
+                remove_idcs.append(i)
+            elif np.any(self.N3_idcs == idxs[i][0]) and np.any(self.N3_idcs == idxs[i][1]):
+                remove_idcs.append(i)
+            elif np.any(self.N4_idcs == idxs[i][0]) and np.any(self.N4_idcs == idxs[i][1]):
+                remove_idcs.append(i)
+        idxs = np.delete(idxs, remove_idcs, 0)
+        #Calculate all distances
+        dist = self.haversine(all_lats[idxs[:,0]], all_lons[idxs[:,0]], all_lats[idxs[:,1]], all_lons[idxs[:,1]])
+        n = len(dist)
+
+        #Degree constraints: any selected nodes must have an incoming and outoing edge (degree 2)
+        A_deg = np.zeros((total_nodes, n+total_nodes))
+        for i in range(total_nodes):
+            edgeMask = np.logical_or(idxs[:,0] == i, idxs[:,1] == i).astype(int)
+            A_deg[i,0:n] = edgeMask
+            A_deg[i,n+i] = -2
+        b_deg = np.zeros((total_nodes, 1))
+
+        #Group constraints: Only select on node out of any group
+        A_group = np.zeros((len(self.lat_eNBs), n + total_nodes))
+        A_group[0, n+self.N1_idcs] = 1
+        A_group[1, n+self.N2_idcs] = 1
+        A_group[2, n+self.N3_idcs] = 1
+        A_group[3, n+self.N4_idcs] = 1
+        b_group = np.ones((len(self.lat_eNBs), 1))
+
+        #Enforce the starting and stopping point
+        A_start = np.zeros((1,n + total_nodes))
+        A_start[0,n] = 1
+        b_start = np.ones((1,1))
+
+        c = np.squeeze(np.concatenate((np.reshape(dist, (1,-1)), np.zeros((1,total_nodes))), axis=1))
+
+        A_eq = np.concatenate((A_deg, A_group, A_start), axis=0)
+        b_eq = np.concatenate((b_deg, b_group, b_start), axis=0)
+
+        # print(c.shape)
+        # print(A_eq.shape)
+        # print(b_eq.shape)
+
+        res = opt.linprog(c,A_eq=A_eq, b_eq=b_eq, bounds=(0,1), integrality=1)
+        x_edges = np.round(res.x[0:n])
+        y_nodes = np.round(res.x[n::])
+        selected_nodes = np.squeeze(np.where(y_nodes == 1))
+        selected_edges = np.squeeze(idxs[np.where(x_edges == 1),:])
+
+        edges_copy = np.copy(selected_edges)
+        #Extract node ordering
+        ordered_nodes = []
+        ordered_nodes.append(selected_edges[0,0])
+        ordered_nodes.append(selected_edges[0,1])
+        edges_copy = np.delete(edges_copy, 0, axis=0)
+
+        for i in range(2,5):
+            idx = np.squeeze(np.where(edges_copy[:,0] == ordered_nodes[i-1]))
+            if np.any(idx):
+                ordered_nodes.append(edges_copy[idx,1])
+                edges_copy = np.delete(edges_copy, idx, axis=0)
+            else:
+                idx = np.squeeze(np.where(edges_copy[:,1] == ordered_nodes[i-1]))
+                ordered_nodes.append(edges_copy[idx,0])
+                edges_copy = np.delete(edges_copy, idx, axis=0)
+
+        lat_stops = all_lats[ordered_nodes]
+        lon_stops = all_lons[ordered_nodes]
+
+        idx = np.squeeze(np.where(np.logical_and(ordered_nodes >= self.N3_idcs[0], ordered_nodes <= self.N3_idcs[-1])))
+
+        lat_stops = np.insert(lat_stops, [idx, idx+1], self.dummy_waypoint_lat)
+        lon_stops = np.insert(lon_stops, [idx, idx+1], self.dummy_waypoint_lon)
         # If you do not use a plan file, there are a set of defualt waypoints. Please check at the end of this function to know how to use.
         # If you use a plan file from the QGroundControl and want to extract the waypoints. Use: extractWaypointsFromPlanFile function
         # This will return you the same format waypoints from your plan file used at the end of this function.
         # Example: How to extract waypoints from plan file
-        myWaypoints = self.extractWaypointsFromPlanFile('aadm.plan')
+        #myWaypoints = self.extractWaypointsFromPlanFile('aadm.plan')
         # print(myWaypoints)
                       
         # Example. How to use waypoints in the experiment
-        self.waypoints = myWaypoints
-        
+        #self.waypoints = myWaypoints
+        for i in range(len(lat_stops)):
+            self.waypoints.append({"latitude": lat_stops[i], "longitude": lon_stops[i]})
                 
         ########################################### Please don't modify this code ############################
         # Default waypoints if no waypoints are generated by the experimenter.                    
@@ -229,11 +407,7 @@ class DataMule(StateMachine):
         # Example. How to extract SNRs with corresponding LWs. 
         SNRs = self.checkSNR()
         for bs_id, snr in SNRs.items():
-            print(f"BS{bs_id}>SNR: {snr}") #please check _vehicle_log.txt in /root/Results directory                            
-        
-        
-                                                   
-
+            print(f"BS{bs_id}>SNR: {snr}") #please check _vehicle_log.txt in /root/Results directory
         
         #SNRs = self.checkSignalStrengths()
         sorted_snr = sorted(SNRs.items(), key=lambda item: item[1], reverse=True)        
@@ -301,9 +475,9 @@ class DataMule(StateMachine):
         self.start_time = datetime.datetime.now()
 
         #print("Taking off")
-                
+        AERPAW_Platform.log_to_oeo(f"Calculating trajectory")
         self.compute_initial_waypoints()                
-        
+        AERPAW_Platform.log_to_oeo(f"Finished calculating trajectory")
         ## Start the independent task for updating base stations every second
         asyncio.ensure_future(self.run_update_target_bs())
     
