@@ -44,7 +44,7 @@ class DataMule(StateMachine):
     update_bs_id =""
     nextWaypointIndex = 0
     lastWaypointIndex = 0  
-    nextBS = []
+    nextBS = [0]
     waitTime = 0
     uav_altitude = 25
     angles = []
@@ -63,7 +63,7 @@ class DataMule(StateMachine):
     lat_eNBs = [35.7275, 35.728056, 35.725, 35.733056]
     lon_eNBs = [-78.695833, -78.700833, -78.691667, -78.698333]
     alt_eNBs = [10, 10, 10, 10] # altitudes for eNodeBs
-    r_eNBs = [0.0005, 0.0005, 0.0008, 0.003] #Radius for eNobeB neighborhoods
+    r_eNBs = [0.00028, 0.0005, 0.0008, 0.003] #Radius for eNobeB neighborhoods
     dummy_waypoint_lon = -78.6943
     dummy_waypoint_lat = 35.7249
 
@@ -266,11 +266,11 @@ class DataMule(StateMachine):
     def compute_initial_waypoints(self):       
         # Write your code here
         N = 10
-        total_nodes = N*len(self.lat_eNBs) + 1
+        total_nodes = N*len(self.lat_eNBs)
         all_lons = np.zeros((len(self.lat_eNBs), N))
         all_lats = np.zeros((len(self.lat_eNBs), N))
+        lz_lat = 35.7271223
         lz_lon = -78.6962747
-        lz_lat = 35.7274823
         geofence_lon, geofence_lat = self.readGeofence('./AERPAW_UAV_Geofence_Phase_1.kml')
 
         for i in range(len(self.lat_eNBs)):
@@ -278,14 +278,14 @@ class DataMule(StateMachine):
             plt.scatter(lonSamples,latSamples, marker='x')
             all_lons[i,:] = lonSamples
             all_lats[i,:] = latSamples
-        all_lons = np.reshape(all_lons, (1,-1))
-        all_lats = np.reshape(all_lats, (1,-1))
-        all_lats = np.insert(all_lats, 0, lz_lat)
-        all_lons = np.insert(all_lons, 0, lz_lon)
+        all_lons = np.squeeze(np.reshape(all_lons, (1,-1)))
+        all_lats = np.squeeze(np.reshape(all_lats, (1,-1)))
+        # all_lats = np.insert(all_lats, 0, lz_lat)
+        # all_lons = np.insert(all_lons, 0, lz_lon)
 
         idxs  = list(combinations(np.arange(0,total_nodes), 2))
 
-        self.N1_idcs = np.arange(start=1, stop = 1+N)
+        self.N1_idcs = np.arange(start=0, stop = N)
         self.N2_idcs = self.N1_idcs + N
         self.N3_idcs = self.N2_idcs + N
         self.N4_idcs = self.N3_idcs + N
@@ -337,8 +337,8 @@ class DataMule(StateMachine):
         # print(b_eq.shape)
 
         res = opt.linprog(c,A_eq=A_eq, b_eq=b_eq, bounds=(0,1), integrality=1)
-        tot_dist = res.x @ c
-        self.flying_time_at_max_v = tot_dist / 10
+        # tot_dist = res.x @ c
+        # self.flying_time_at_max_v = tot_dist / 10
 
         x_edges = np.round(res.x[0:n])
         y_nodes = np.round(res.x[n::])
@@ -362,6 +362,19 @@ class DataMule(StateMachine):
                 ordered_nodes.append(edges_copy[idx,0])
                 edges_copy = np.delete(edges_copy, idx, axis=0)
 
+        idx = np.squeeze(np.where(np.logical_and(ordered_nodes >= self.N1_idcs[0], ordered_nodes <= self.N1_idcs[-1])))
+        if len(idx) > 1:
+            if ordered_nodes[1] >= self.N4_idcs[0] and ordered_nodes[1] <= self.N4_idcs[-1]:
+                ordered_nodes = np.delete(ordered_nodes, -1)
+            else:
+                ordered_nodes = np.flip(ordered_nodes)
+                ordered_nodes = np.delete(ordered_nodes, -1)
+        else:
+            if ordered_nodes[idx-1] >= self.N4_idcs[0] and ordered_nodes[idx-1] <= self.N4_idcs[-1]:
+                ordered_nodes = np.flip(ordered_nodes)
+            ordered_nodes = np.delete(ordered_nodes, -1)
+            ordered_nodes = np.roll(ordered_nodes, -idx)
+
         lat_stops = all_lats[ordered_nodes]
         lon_stops = all_lons[ordered_nodes]
 
@@ -379,11 +392,21 @@ class DataMule(StateMachine):
                 self.nextBS.append(0)
 
         self.nextBS = np.insert(self.nextBS, [BS3_idx, BS3_idx+1], -1)
+        self.nextBS = np.append(self.nextBS, 0)
 
         idx = np.squeeze(np.where(np.logical_and(ordered_nodes >= self.N3_idcs[0], ordered_nodes <= self.N3_idcs[-1])))
 
         lat_stops = np.insert(lat_stops, [idx, idx+1], self.dummy_waypoint_lat)
         lon_stops = np.insert(lon_stops, [idx, idx+1], self.dummy_waypoint_lon)
+        lat_stops = np.insert(lat_stops, 0, lz_lat)
+        lon_stops = np.insert(lon_stops, 0, lz_lon)
+        lat_stops = np.append(lat_stops, lz_lat)
+        lon_stops = np.append(lon_stops, lz_lon)
+
+        self.tot_dist = res.x @ c
+        # for i in range(len(lat_stops)-1):
+        #     self.tot_dist += self.haversine(lat_stops[i], lon_stops[i],lat_stops[i+1], lon_stops[i+1])
+        self.flying_time_at_max_v = self.tot_dist / 10
         # If you do not use a plan file, there are a set of defualt waypoints. Please check at the end of this function to know how to use.
         # If you use a plan file from the QGroundControl and want to extract the waypoints. Use: extractWaypointsFromPlanFile function
         # This will return you the same format waypoints from your plan file used at the end of this function.
@@ -396,7 +419,7 @@ class DataMule(StateMachine):
         for i in range(len(lat_stops)):
             self.waypoints.append({"latitude": lat_stops[i], "longitude": lon_stops[i]})
             AERPAW_Platform.log_to_oeo(f"Waypoint: Latitude: {lat_stops[i]}, Longitude: {lon_stops[i]}, BS: {self.nextBS[i]}")
-        AERPAW_Platform.log_to_oeo(f"Total distance: {tot_dist}")
+        AERPAW_Platform.log_to_oeo(f"Total distance: {self.tot_dist}")
                 
         ########################################### Please don't modify this code ############################
         # Default waypoints if no waypoints are generated by the experimenter.                    
@@ -412,6 +435,33 @@ class DataMule(StateMachine):
 
         self.lastWaypointIndex = len(self.waypoints) - 1   
     
+    def remove_waypoint(self, remove_BS):
+        lz_lat = 35.7271223
+        lz_lon = -78.6962747
+
+        idcs = []
+        BS_idx = np.squeeze(np.where(self.nextBS == remove_BS))
+        idcs.append(BS_idx)
+        if remove_BS == 2 and self.nextBS[BS_idx + 1] == -1:
+            self.nextBS = np.insert(self.nextBS, BS_idx+1, 0)
+            self.waypoints = np.insert(self.waypoints, BS_idx+1, {"latitude": lz_lat, "longitude": lz_lon})
+            self.lastWaypointIndex += 1
+        #Remove waypoints for BS3
+        if remove_BS == 3:
+            idcs.append(BS_idx-1)
+            idcs.append(BS_idx+1)
+            self.lastWaypointIndex -= 2
+        
+        self.nextBS = np.delete(self.nextBS, idcs)
+        self.waypoints = np.delete(self.waypoints, idcs)
+
+        dist=[]
+        for i in range(len(self.waypoints)-1):
+            dist.append(self.haversine(self.waypoints[i]["latitude"], self.waypoints[i]["longitude"], self.waypoints[i+1]["latitude"], self.waypoints[i+1]["longitude"]))
+        self.tot_dist = np.sum(dist)
+        self.lastWaypointIndex -= 1
+        #AERPAW_Platform.log_to_oeo(f"Last index: {self.lastWaypointIndex}")
+
     
     def update_target_bs(self):
         
@@ -428,10 +478,80 @@ class DataMule(StateMachine):
             if total_volume == 0:
                 self.cnt = 0
             else:
-                for bs_id, volume in data_volume.items():
-                    self.BS_time[bs_id] = (volume / total_volume) * (500 - self.flying_time_at_max_v - 30) #subtract 30 for landing
-                    AERPAW_Platform.log_to_oeo(f"BS{bs_id}>Alotted Time: {self.BS_time[bs_id]}")
-                    #print(f"BS{bs_id}>Alotted Time: {self.BS_time[bs_id]}")
+                visit_BS = []
+                for bs_id, volume in self.volumes.items():
+                    if volume == 0:
+                        self.remove_waypoint(int(bs_id))
+                        self.BS_time[bs_id] = 0
+                        AERPAW_Platform.log_to_oeo(f"BS{bs_id}> Removed")
+                        continue
+                    if volume < 70:
+                        self.BS_time[bs_id] = 0
+                        total_volume -= volume
+                        continue
+                    elif bs_id == "4" and volume / total_volume < 0.15:
+                        self.remove_waypoint(4)
+                        self.BS_time["4"] = 0
+                        total_volume -= volume
+                        AERPAW_Platform.log_to_oeo(f"BS{4}> Removed")
+                        continue
+                    visit_BS.append(bs_id)
+                num_BS_visits = len(visit_BS)
+                self.flying_time_at_max_v = self.tot_dist / 10
+                AERPAW_Platform.log_to_oeo(f"Final Waypoints: {self.waypoints}")
+                for bs in visit_BS:
+                    self.BS_time[bs] = (self.volumes[bs] / total_volume) * (500 - self.flying_time_at_max_v - 30) #subtract 30 for landing
+                    if np.isin('1', visit_BS):
+                        if bs == "1":
+                            self.BS_time[bs] -= 10
+                        else:
+                            self.BS_time[bs] += 10 / num_BS_visits
+
+                # time_from_LW4 = 0
+                # skip_L4 = False
+                # if self.volumes["4"]  / total_volume < 0.15:
+                #     skip_L4 = True
+                #     self.remove_waypoint(4)
+                #     # self.tot_dist -= self.visit_4_dist
+                #     # self.tot_dist += self.skip_4_dist
+                #     self.flying_time_at_max_v = self.tot_dist / 10
+                #     #time_from_LW4 = (self.volumes["4"] / total_volume) * (500 - self.flying_time_at_max_v - 30) / 3
+                #     self.BS_time["4"] = 0
+                # for bs_id, volume in self.volumes.items():
+                #     if bs_id == "4" and skip_L4:
+                #         continue
+                #     self.BS_time[bs_id] = (volume / total_volume) * (500 - self.flying_time_at_max_v - 30) #subtract 30 for landing
+                #     #AERPAW_Platform.log_to_oeo(f"BS{bs_id}>Alotted Time: {self.BS_time[bs_id]}")
+                #     #print(f"BS{bs_id}>Alotted Time: {self.BS_time[bs_id]}")
+                # #add the bonus time from L4
+                # self.BS_time["1"] += time_from_LW4
+                # self.BS_time["2"] += time_from_LW4
+                # self.BS_time["3"] += time_from_LW4
+                # #Redistribude a fixed amount of time to other BS as BS1 gets a lot of data from takeoff/landing time
+                # self.BS_time["1"] = np.max([0, self.BS_time["1"]-10])
+                # if skip_L4:
+                #     self.BS_time["2"] += 5
+                #     self.BS_time["3"] += 5
+                # else:
+                #     self.BS_time["2"] += 3
+                #     self.BS_time["3"] += 4
+                #     self.BS_time["4"] += 3
+
+                for bs_id, time in self.BS_time.items():
+                    AERPAW_Platform.log_to_oeo(f"BS{bs_id}>Alotted Time: {time}")
+
+                #If skipping L4 remove from waypoints
+                # if skip_L4:
+                #     idx = np.squeeze(np.where(self.nextBS == 4))
+                #     AERPAW_Platform.log_to_oeo(f"Removing waypoint: {idx}")
+                #     AERPAW_Platform.log_to_oeo(f"Prev BSs: {self.nextBS}")
+                #     AERPAW_Platform.log_to_oeo(f"Prev Waypoints: {self.waypoints}")
+                #     self.nextBS = np.delete(self.nextBS, idx)
+                #     self.waypoints = np.delete(self.waypoints, idx)
+                #     AERPAW_Platform.log_to_oeo(f"new BSs: {self.nextBS}")
+                #     AERPAW_Platform.log_to_oeo(f"new Waypoints: {self.waypoints}")
+                #     self.lastWaypointIndex -= 1
+
         #else:
         #    pass
         
@@ -532,7 +652,6 @@ class DataMule(StateMachine):
     @state(name="start", first=True)
     async def start(self, vehicle: Drone):
         #self.init_args()
-        
         #reset
         self.updateWaypoint = False
         self.setBSForBroadcast("")
@@ -562,7 +681,6 @@ class DataMule(StateMachine):
 
     @state(name="go_forward")
     async def go_forward(self, vehicle: Vehicle):
-    
         # home_coords = Coordinate(
             # vehicle.home_coords.lat, vehicle.home_coords.lon, vehicle.position.alt
         # )
@@ -618,10 +736,12 @@ class DataMule(StateMachine):
         moving = asyncio.ensure_future(
             vehicle.goto_coordinates(next_pos) #, target_heading=self._default_heading)
         )
-        
+
         while not moving.done(): # wait until the vehicle is done moving
             #self.update_target_bs()
             await asyncio.sleep(0.2)
+            #Here check the current BS we are heading towards.. not as simple as nextBS[self.nextWaypointIndex]...
+            #Check its current download and volume, if weve finished cancel moving
 
         await moving
         AERPAW_Platform.log_to_oeo(f"Arrived at Waypoint: {self.nextWaypointIndex}, BS: {self.curr_BS}")
