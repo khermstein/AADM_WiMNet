@@ -59,6 +59,7 @@ class DataMule(StateMachine):
     curr_BS = -1
     time_flag = False
     download_flag = False
+    cancel_flight_flag = False
 
     lat_eNBs = [35.7275, 35.728056, 35.725, 35.733056]
     lon_eNBs = [-78.695833, -78.700833, -78.691667, -78.698333]
@@ -499,58 +500,33 @@ class DataMule(StateMachine):
                 num_BS_visits = len(visit_BS)
                 self.flying_time_at_max_v = self.tot_dist / 10
                 AERPAW_Platform.log_to_oeo(f"Final Waypoints: {self.waypoints}")
+
+                time_diff = 0
                 for bs in visit_BS:
                     self.BS_time[bs] = (self.volumes[bs] / total_volume) * (500 - self.flying_time_at_max_v - 30) #subtract 30 for landing
+                    if self.volumes[bs] < 100 and self.BS_time[bs] > 20:
+                        time_diff += self.BS_time[bs] - 20
+                        self.BS_time[bs] = 20
+
+                    # Redistribute some of the time for 1
                     if np.isin('1', visit_BS):
                         if bs == "1":
                             self.BS_time[bs] -= 10
                         else:
                             self.BS_time[bs] += 10 / num_BS_visits
 
-                # time_from_LW4 = 0
-                # skip_L4 = False
-                # if self.volumes["4"]  / total_volume < 0.15:
-                #     skip_L4 = True
-                #     self.remove_waypoint(4)
-                #     # self.tot_dist -= self.visit_4_dist
-                #     # self.tot_dist += self.skip_4_dist
-                #     self.flying_time_at_max_v = self.tot_dist / 10
-                #     #time_from_LW4 = (self.volumes["4"] / total_volume) * (500 - self.flying_time_at_max_v - 30) / 3
-                #     self.BS_time["4"] = 0
-                # for bs_id, volume in self.volumes.items():
-                #     if bs_id == "4" and skip_L4:
-                #         continue
-                #     self.BS_time[bs_id] = (volume / total_volume) * (500 - self.flying_time_at_max_v - 30) #subtract 30 for landing
-                #     #AERPAW_Platform.log_to_oeo(f"BS{bs_id}>Alotted Time: {self.BS_time[bs_id]}")
-                #     #print(f"BS{bs_id}>Alotted Time: {self.BS_time[bs_id]}")
-                # #add the bonus time from L4
-                # self.BS_time["1"] += time_from_LW4
-                # self.BS_time["2"] += time_from_LW4
-                # self.BS_time["3"] += time_from_LW4
-                # #Redistribude a fixed amount of time to other BS as BS1 gets a lot of data from takeoff/landing time
-                # self.BS_time["1"] = np.max([0, self.BS_time["1"]-10])
-                # if skip_L4:
-                #     self.BS_time["2"] += 5
-                #     self.BS_time["3"] += 5
-                # else:
-                #     self.BS_time["2"] += 3
-                #     self.BS_time["3"] += 4
-                #     self.BS_time["4"] += 3
+                # Redistribute time diff to BS above threshold
+                BS_above_thresh_counter = 0
+                for bs_id, volume in self.volumes.items():
+                    if volume > 100:
+                        BS_above_thresh_counter += 1
+                
+                for bs_id, volume in self.volumes.items():
+                    if volume > 100:
+                        self.BS_time[bs_id] += time_diff / BS_above_thresh_counter
 
                 for bs_id, time in self.BS_time.items():
                     AERPAW_Platform.log_to_oeo(f"BS{bs_id}>Alotted Time: {time}")
-
-                #If skipping L4 remove from waypoints
-                # if skip_L4:
-                #     idx = np.squeeze(np.where(self.nextBS == 4))
-                #     AERPAW_Platform.log_to_oeo(f"Removing waypoint: {idx}")
-                #     AERPAW_Platform.log_to_oeo(f"Prev BSs: {self.nextBS}")
-                #     AERPAW_Platform.log_to_oeo(f"Prev Waypoints: {self.waypoints}")
-                #     self.nextBS = np.delete(self.nextBS, idx)
-                #     self.waypoints = np.delete(self.waypoints, idx)
-                #     AERPAW_Platform.log_to_oeo(f"new BSs: {self.nextBS}")
-                #     AERPAW_Platform.log_to_oeo(f"new Waypoints: {self.waypoints}")
-                #     self.lastWaypointIndex -= 1
 
         #else:
         #    pass
@@ -647,6 +623,7 @@ class DataMule(StateMachine):
             await asyncio.sleep(1)
             download_data = self.checkDownload()
             curr_download = download_data[str(self.curr_BS)]
+        AERPAW_Platform.log_to_oeo(f"Setting Download Flag: {curr_download}, {self.volumes[str(self.curr_BS)]}")
         self.download_flag = True
     
     @state(name="start", first=True)
@@ -666,7 +643,7 @@ class DataMule(StateMachine):
         AERPAW_Platform.log_to_oeo(f"Finished calculating trajectory")
         ## Start the independent task for updating base stations every second
         asyncio.ensure_future(self.run_update_target_bs())
-    
+        
         await vehicle.takeoff(25) # fixed 25m
         #print("Took off")    
         AERPAW_Platform.log_to_oeo(f"Taking off to {25}m")
@@ -689,8 +666,6 @@ class DataMule(StateMachine):
         await vehicle.set_groundspeed(self.target_speed)
         
         cur_pos = vehicle.position
-        
-        
         
         #print("drone",cur_pos)
         #print(type(cur_pos))
@@ -723,28 +698,95 @@ class DataMule(StateMachine):
         
         (valid_waypoint, msg) = self.safety_checker.validateWaypointCommand(
             cur_pos, next_pos
-        )        
+        )
         
         # if the next location violates the geofence, return home
         if not valid_waypoint:        
             print("Can't go there:")
             return "return_to_launch_and_land"
+        self.cancel_flight_flag = False
+        if self.curr_BS > 0:
+            download_data = self.checkDownload()
+            if download_data[str(self.curr_BS)] >= self.volumes[str(self.curr_BS)]:
+                self.cancel_flight_flag = True
+        elif self.curr_BS == -1 and self.nextBS[self.nextWaypointIndex+1] == 3:
+            download_data = self.checkDownload()
+            if download_data["3"] >= self.volumes["3"]:
+                self.cancel_flight_flag = True
+                self.nextWaypointIndex += 2
 
+        if not self.cancel_flight_flag:
+            curr_coord = Coordinate(vehicle.position.lat, vehicle.position.lon, vehicle.position.alt)
+            full_vector = next_pos - curr_coord
+            move_vector = 0.5 * full_vector
+
+            # otherwise move forward to the next location
+            #print("UAV goes towards the target base station")
+            moving = asyncio.ensure_future(
+                vehicle.goto_coordinates(vehicle.position + move_vector) #, target_heading=self._default_heading)
+            )
+
+            while not moving.done(): # wait until the vehicle is done moving
+                await asyncio.sleep(0.2)
+
+            await moving
+
+            # We have traveled halfway, check if we finished downloading while en route
+            if self.curr_BS > 0:
+                download_data = self.checkDownload()
+                if download_data[str(self.curr_BS)] >= self.volumes[str(self.curr_BS)]:
+                    self.cancel_flight_flag = True
+            elif self.curr_BS == -1 and self.nextBS[self.nextWaypointIndex+1] == 3:
+                download_data = self.checkDownload()
+                if download_data["3"] >= self.volumes["3"]:
+                    self.cancel_flight_flag = True
+                    self.nextWaypointIndex += 2
+
+            if self.cancel_flight_flag:
+                AERPAW_Platform.log_to_oeo(f"Finished download en route to: {self.nextWaypointIndex}, BS: {self.curr_BS}")
+            else:
+                moving = asyncio.ensure_future(
+                    vehicle.goto_coordinates(next_pos) #, target_heading=self._default_heading)
+                )
+                while not moving.done(): # wait until the vehicle is done moving
+                    await asyncio.sleep(0.2)
+
+                await moving
+                AERPAW_Platform.log_to_oeo(f"Arrived at Waypoint: {self.nextWaypointIndex}, BS: {self.curr_BS}")
+        else:
+            AERPAW_Platform.log_to_oeo(f"Already finished download for: {self.nextWaypointIndex}, BS: {self.curr_BS}")
+        # Try moving in 1 meter increments along the way to waypoint
+        # self.cancel_flight_flag = False
+        # curr_coord = Coordinate(vehicle.position.lat, vehicle.position.lon, vehicle.position.alt)
+        # distance = curr_coord.distance(next_pos)
+        # full_vector = next_pos - curr_coord
+        # norm_vector = full_vector.norm()
+        # arrived = False
+        # while not arrived:
+        #     curr_coord = Coordinate(vehicle.position.lat, vehicle.position.lon, vehicle.position.alt)
+        #     distance = curr_coord.distance(next_pos)
+        #     if distance < 0.1:
+        #         arrived = True
+        #         vector = 0*norm_vector
+        #     elif distance > 10:
+        #         vector = 10*norm_vector
+        #     elif distance > 5:
+        #         vector = 5*norm_vector
+        #     else:
+        #         vector = 3*norm_vector
+
+        #     await vehicle.set_velocity(vector, duration=1)
+
+        #     if self.curr_BS > 0:
+        #         download_data = self.checkDownload()
+        #         if download_data[str(self.curr_BS)] >= self.volumes[str(self.curr_BS)]:
+        #             self.cancel_flight_flag = True
+        #             AERPAW_Platform.log_to_oeo(f"Finished download en route to: {self.nextWaypointIndex}, BS: {self.curr_BS}")
+        #             break
+            
+        # if arrived:
+        #     AERPAW_Platform.log_to_oeo(f"Arrived at Waypoint: {self.nextWaypointIndex}, BS: {self.curr_BS}")
         
-        # otherwise move forward to the next location
-        #print("UAV goes towards the target base station")
-        moving = asyncio.ensure_future(
-            vehicle.goto_coordinates(next_pos) #, target_heading=self._default_heading)
-        )
-
-        while not moving.done(): # wait until the vehicle is done moving
-            #self.update_target_bs()
-            await asyncio.sleep(0.2)
-            #Here check the current BS we are heading towards.. not as simple as nextBS[self.nextWaypointIndex]...
-            #Check its current download and volume, if weve finished cancel moving
-
-        await moving
-        AERPAW_Platform.log_to_oeo(f"Arrived at Waypoint: {self.nextWaypointIndex}, BS: {self.curr_BS}")
         self.updateWaypoint = True
         
         #print('self.nextWaypointIndex: ',self.nextWaypointIndex, 'self.lastWaypointIndex: ',self.lastWaypointIndex)
@@ -758,7 +800,8 @@ class DataMule(StateMachine):
         
         download_complete = str(self.getToken())
         #print('download_complete', download_complete)
-        if self.nextWaypointIndex == self.lastWaypointIndex or download_complete == '-1' or self.t1 >= self.flight_time:                    
+        if self.nextWaypointIndex == self.lastWaypointIndex or download_complete == '-1' or self.t1 >= self.flight_time:
+            AERPAW_Platform.log_to_oeo(f"Token Detected")              
             return "return_to_launch_and_land"  
         #Update waypoints     
         #self.update_uav_waypoints()
@@ -775,7 +818,7 @@ class DataMule(StateMachine):
         #cur_pos = vehicle.position
         AERPAW_Platform.log_to_oeo(f"Awaiting BS: {self.curr_BS}")
         await asyncio.sleep(2) #wait four seconds
-        if self.curr_BS == -1 or self.curr_BS == 0:
+        if self.curr_BS == -1 or self.curr_BS == 0 or self.cancel_flight_flag:
             return "go_forward"
         
         #await asyncio.sleep(self.waitTime)  # Non-blocking wait for self.waitTime
@@ -799,11 +842,13 @@ class DataMule(StateMachine):
         if self.time_flag:
             AERPAW_Platform.log_to_oeo(f"Time limit reached for BS: {self.curr_BS}")
             self.time_flag = False
+            self.download_flag = False
             download_detector.cancel()
             return "go_forward"
         elif self.download_flag:
             AERPAW_Platform.log_to_oeo(f"Download complete for BS: {self.curr_BS}")
             self.download_flag = False
+            self.time_flag = False # Reset both flag just in case
             timer.cancel()
             return "go_forward"
 
@@ -821,10 +866,12 @@ class DataMule(StateMachine):
             if self.time_flag:
                 AERPAW_Platform.log_to_oeo(f"Time limit reached for BS: {self.curr_BS}")
                 self.time_flag = False
+                self.download_flag = False
                 download_detector.cancel()
                 return "go_forward"
             elif self.download_flag:
                 AERPAW_Platform.log_to_oeo(f"Download complete for BS: {self.curr_BS}")
+                self.time_flag = False
                 self.download_flag = False
                 timer.cancel()
                 return "go_forward"
@@ -846,6 +893,7 @@ class DataMule(StateMachine):
             if self.time_flag:
                 AERPAW_Platform.log_to_oeo(f"Time limit reached for BS: {self.curr_BS}")
                 self.time_flag = False
+                self.download_flag = False
                 download_detector.cancel()
                 break
         
@@ -853,6 +901,7 @@ class DataMule(StateMachine):
             download_detector.cancel()
         else:
             AERPAW_Platform.log_to_oeo(f"Download complete for BS: {self.curr_BS}")
+            self.time_flag = False
             self.download_flag = False
             timer.cancel()
 
@@ -861,9 +910,40 @@ class DataMule(StateMachine):
           
     @state(name="return_to_launch_and_land")
     async def return_to_launch_and_land(self, vehicle: Drone):
-        cur_pos = vehicle.position                
-        print('Return to launch and landing.')
+        lz_lat = 35.7271223
+        lz_lon = -78.6962747
+        cur_pos = vehicle.position
+        AERPAW_Platform.log_to_oeo('Return to launch and landing.')
 
+        if cur_pos.lon > self.dummy_waypoint_lon:
+            AERPAW_Platform.log_to_oeo('Using dummy waypoint')
+            dummy_waypoint = Coordinate(self.dummy_waypoint_lat, self.dummy_waypoint_lon, vehicle.position.alt)
+            new_heading = cur_pos.bearing(dummy_waypoint)
+            turning = asyncio.ensure_future(vehicle.set_heading(new_heading))
+            # wait for vehicle to finish turning
+            while not turning.done():
+                await asyncio.sleep(0.2)
+
+            await turning        
+                    
+            await vehicle.goto_coordinates(
+                dummy_waypoint #, target_heading=self._default_heading
+            )
+
+        if cur_pos.lon > lz_lon:
+            AERPAW_Platform.log_to_oeo('Using dummy lz')
+            dummy_waypoint = Coordinate(lz_lat, lz_lon, vehicle.position.alt)
+            new_heading = cur_pos.bearing(dummy_waypoint)
+            turning = asyncio.ensure_future(vehicle.set_heading(new_heading))
+            # wait for vehicle to finish turning
+            while not turning.done():
+                await asyncio.sleep(0.2)
+
+            await turning        
+                    
+            await vehicle.goto_coordinates(
+                dummy_waypoint #, target_heading=self._default_heading
+            )
         
         home_coords = Coordinate(
             vehicle.home_coords.lat, vehicle.home_coords.lon, vehicle.position.alt
